@@ -218,6 +218,72 @@ async def test_generate_questions_maps_answer_not_in_options_to_validation() -> 
     assert result.error_kind == "validation"
     assert result.questions == []
     assert result.schema_valid is False
+    assert result.error == "LLM validation error"
+    assert result.failure.reason == "answer_not_in_options"
+    assert result.failure.message == (
+        "True/false answer must be one of ['True', 'False'], got 'A base case'"
+    )
+    assert result.failure.item_index == 0
+    assert result.failure.item.question == (
+        "Every recursive function needs a base case."
+    )
+    assert result.failure.item.answer == "A base case"
+
+
+@pytest.mark.asyncio
+async def test_generate_questions_records_failure_from_parsing_error() -> None:
+    """QuestionOutput validation arrives as parsing_error, not a raised exception."""
+    from app.core.ai.openai import generate_questions
+    from app.models import QuestionOutput
+
+    with pytest.raises(ValidationError) as exc_info:
+        QuestionOutput(
+            questions=[
+                {
+                    "question": "Is recursion useful?",
+                    "answer": "True",
+                    "type": "true_false",
+                    "options": ["True", "False"],
+                },
+                {
+                    "question": "Every recursive function needs a base case.",
+                    "answer": "A base case",
+                    "type": "true_false",
+                    "options": ["True", "False"],
+                },
+            ]
+        )
+    parsing_error = exc_info.value
+
+    mock_llm = MagicMock()
+    mock_llm.ainvoke = AsyncMock(
+        return_value={"parsed": None, "raw": None, "parsing_error": parsing_error}
+    )
+
+    with patch("app.core.ai.openai._question_llm", return_value=mock_llm):
+        result = await generate_questions(
+            "lecture text", prompt_id="a", num_questions=2
+        )
+
+    assert result.ok is False
+    assert result.error_kind == "parse"
+    assert result.error == "Failed to parse LLM output"
+    assert result.questions == []
+    assert result.schema_valid is False
+    assert "A base case" not in (result.error or "")
+    assert result.failure is not None
+    assert result.failure.reason == "answer_not_in_options"
+    assert result.failure.message == (
+        "True/false answer must be one of ['True', 'False'], got 'A base case'"
+    )
+    assert result.failure.item_index == 1
+    assert result.failure.item is not None
+    assert result.failure.item.question == (
+        "Every recursive function needs a base case."
+    )
+    assert result.failure.item.answer == "A base case"
+    assert result.failure.item.type == "true_false"
+    assert result.failure.item.options == ["True", "False"]
 
 
 @pytest.mark.asyncio
