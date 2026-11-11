@@ -44,6 +44,22 @@ ErrorKind = Literal["validation", "parse", "provider"]
 
 
 @dataclass
+class GenerationFailureItem:
+    question: str | None
+    answer: str | None
+    type: str | None
+    options: list[str] | None
+
+
+@dataclass
+class GenerationFailure:
+    reason: str
+    message: str
+    item_index: int | None
+    item: GenerationFailureItem | None
+
+
+@dataclass
 class GenerationResult:
     prompt_id: str
     ok: bool
@@ -57,6 +73,7 @@ class GenerationResult:
     final_contract_valid: bool
     content_checks: dict[str, Any]
     questions: list[QuestionCreate]
+    failure: GenerationFailure | None = None
 
 
 def normalize_question_types(
@@ -174,11 +191,147 @@ def validate_and_convert_question_item(q: Any) -> QuestionCreate | None:
         raise
 
 
+def _item_index_from_loc(loc: object) -> int | None:
+    if isinstance(loc, tuple):
+        for part in loc:
+            if isinstance(part, int):
+                return part
+    return None
+
+
+def _validation_message(error: dict[str, Any]) -> str:
+    """ValueError text from a pydantic error, without the ValidationError repr."""
+    ctx = error.get("ctx")
+    if isinstance(ctx, dict):
+        original = ctx.get("error")
+        if isinstance(original, BaseException):
+            text = str(original)
+            if text:
+                return text
+    msg = error.get("msg")
+    if isinstance(msg, str):
+        prefix = "Value error, "
+        if msg.startswith(prefix):
+            return msg[len(prefix) :]
+        return msg
+    return ""
+
+
+def _classify_validation_reason(message: str) -> str:
+    if message.startswith("True/false answer must be one of"):
+        return "answer_not_in_options"
+    if message.startswith("Answer must be one of the options"):
+        return "answer_not_in_options"
+    return "validation"
+
+
+def _failure_item_from_input(value: Any) -> GenerationFailureItem | None:
+    if not isinstance(value, dict):
+        return None
+    question = value.get("question")
+    if not isinstance(question, str):
+        return None
+    answer = value.get("answer")
+    item_type = value.get("type")
+    options = value.get("options")
+    parsed_options: list[str] | None = None
+    if isinstance(options, list) and all(isinstance(opt, str) for opt in options):
+        parsed_options = list(options)
+    return GenerationFailureItem(
+        question=question,
+        answer=answer if isinstance(answer, str) else None,
+        type=item_type if isinstance(item_type, str) else None,
+        options=parsed_options,
+    )
+
+
+def _failure_from_validation_error(
+    ve: ValidationError,
+    *,
+    item_index: int | None = None,
+) -> GenerationFailure:
+    """Build a failure from ValidationError without copying its full repr."""
+    errors = ve.errors()
+    chosen: Any = None
+    if item_index is None:
+        for err in errors:
+            idx = _item_index_from_loc(err.get("loc"))
+            if idx is not None:
+                chosen = err
+                item_index = idx
+                break
+    else:
+        for err in errors:
+            if _item_index_from_loc(err.get("loc")) == item_index:
+                chosen = err
+                break
+    if chosen is None and errors:
+        chosen = errors[0]
+
+    message = _validation_message(chosen) if chosen is not None else ""
+    raw_input = chosen.get("input") if chosen is not None else None
+    return GenerationFailure(
+        reason=_classify_validation_reason(message),
+        message=message,
+        item_index=item_index,
+        item=_failure_item_from_input(raw_input),
+    )
+
+
+class _QuestionItemValidationError(Exception):
+    """QuestionItem failed validation at a known index in the parsed list.
+
+    QuestionItem is constructed alone, so the pydantic loc is often ().
+    """
+
+    def __init__(self, error: ValidationError, item_index: int) -> None:
+        self.error = error
+        self.item_index = item_index
+        super().__init__("Question item failed validation")
+
+
+def _validation_generation_result(
+    *,
+    prompt_id: str,
+    ve: ValidationError,
+    item_index: int | None,
+    latency_ms: float,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    total_tokens: int | None,
+    num_questions: int,
+) -> GenerationResult:
+    # Do not put str(ve) on GenerationResult.error; it embeds model output.
+    logger.error(
+        "Question generation validation failed (prompt_id=%s, exc_type=%s)",
+        prompt_id,
+        type(ve).__name__,
+    )
+    return GenerationResult(
+        prompt_id=prompt_id,
+        ok=False,
+        error="LLM validation error",
+        error_kind="validation",
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        schema_valid=False,
+        final_contract_valid=False,
+        content_checks=_empty_content_checks(num_questions),
+        questions=[],
+        failure=_failure_from_validation_error(ve, item_index=item_index),
+    )
+
+
 def parse_llm_output(llm_output: Any) -> list[QuestionCreate]:
     """Parse LLM structured output into QuestionCreate list."""
     questions: list[QuestionCreate] = []
-    for q in llm_output.questions:
-        qc = validate_and_convert_question_item(q)
+    for index, q in enumerate(llm_output.questions):
+        try:
+            qc = validate_and_convert_question_item(q)
+        except ValidationError as ve:
+            raise _QuestionItemValidationError(ve, index) from ve
         if qc:
             questions.append(qc)
 
@@ -329,6 +482,12 @@ async def generate_questions(
                     prompt_id,
                     exc_type,
                 )
+                # with_structured_output reports QuestionOutput failures here, not as raises.
+                parse_failure = (
+                    _failure_from_validation_error(parsing_error)
+                    if isinstance(parsing_error, ValidationError)
+                    else None
+                )
                 return GenerationResult(
                     prompt_id=prompt_id,
                     ok=False,
@@ -342,6 +501,7 @@ async def generate_questions(
                     final_contract_valid=False,
                     content_checks=_empty_content_checks(num_questions),
                     questions=[],
+                    failure=parse_failure,
                 )
             llm_output = parsed
         else:
@@ -363,27 +523,29 @@ async def generate_questions(
             content_checks=content_checks,
             questions=questions,
         )
-    except ValidationError as ve:
+    except _QuestionItemValidationError as indexed:
         latency_ms = (time.perf_counter() - started) * 1000
-        # ValidationError.input can include model output; do not forward str(ve).
-        logger.error(
-            "Question generation validation failed (prompt_id=%s, exc_type=%s)",
-            prompt_id,
-            type(ve).__name__,
-        )
-        return GenerationResult(
+        return _validation_generation_result(
             prompt_id=prompt_id,
-            ok=False,
-            error="LLM validation error",
-            error_kind="validation",
+            ve=indexed.error,
+            item_index=indexed.item_index,
             latency_ms=latency_ms,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            schema_valid=False,
-            final_contract_valid=False,
-            content_checks=_empty_content_checks(num_questions),
-            questions=[],
+            num_questions=num_questions,
+        )
+    except ValidationError as ve:
+        latency_ms = (time.perf_counter() - started) * 1000
+        return _validation_generation_result(
+            prompt_id=prompt_id,
+            ve=ve,
+            item_index=None,
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            num_questions=num_questions,
         )
     except Exception as e:
         latency_ms = (time.perf_counter() - started) * 1000

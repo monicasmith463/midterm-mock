@@ -104,6 +104,7 @@ def _serialize_result(
         "schema_valid": result.schema_valid,
         "final_contract_valid": result.final_contract_valid,
         "content_checks": result.content_checks,
+        "failure": _serialize_failure(result.failure),
         "questions": [
             {
                 "question": q.question,
@@ -124,6 +125,25 @@ def _mean(values: list[float]) -> float | None:
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def _serialize_failure(failure):
+    if failure is None:
+        return None
+    item = failure.item
+    return {
+        "reason": failure.reason,
+        "message": failure.message,
+        "item_index": failure.item_index,
+        "item": None
+        if item is None
+        else {
+            "question": item.question,
+            "answer": item.answer,
+            "type": item.type,
+            "options": item.options,
+        },
+    }
 
 
 def _summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
